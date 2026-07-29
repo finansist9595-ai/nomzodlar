@@ -169,6 +169,15 @@ function detectBreakout(bars) {
   return { matched: corePassed === coreCriteria.length, criteria, corePassed, coreTotal: coreCriteria.length };
 }
 
+// Ixtiyoriy, qo'shimcha tasdiq: Higher Low'ni soatlik ma'lumotda tekshirish (foydalanuvchi
+// tasvirlagan "bu narsa soatlikda aniqroq ko'rinadi" mezoni). Breakout'ning asosiy 5 mezoniga
+// TA'SIR QILMAYDI -- faqat qo'shimcha, ixtiyoriy "chuqur tekshiruv" sifatida ko'rsatiladi.
+function detectBreakoutHourlyHL(hourlyBars) {
+  const { lows } = findSwingPoints(hourlyBars, 3);
+  const hlCount = countRecentClassification(lows, 'higher', 5);
+  return { hlCount, confirmed: hlCount >= 2 };
+}
+
 // ---- Reversal: split into a cheap DAILY pre-check (data we already have) and an
 // expensive HOURLY deep-check (only fetched for stocks that already pass the pre-check) ----
 
@@ -889,11 +898,13 @@ export default function NomzodlarTerminal() {
   const [chartBig, setChartBig] = useState({});
   const [journal, setJournal] = useState([]);
   const [notifEnabled, setNotifEnabled] = useState(false);
+  const [lastExportAt, setLastExportAt] = useState(null);
   const [journalForm, setJournalForm] = useState(null); // symbol being logged, or null
   const [running, setRunning] = useState(false);
   const [runningFund, setRunningFund] = useState(false);
   const [runningReversal, setRunningReversal] = useState(false);
   const [runningPullback, setRunningPullback] = useState(false);
+  const [runningBreakoutHL, setRunningBreakoutHL] = useState(false);
   const [progress, setProgress] = useState({ done: 0, total: 0 });
   const stopFlag = useRef(false);
   const importFileRef = useRef(null);
@@ -924,6 +935,7 @@ export default function NomzodlarTerminal() {
           }
           setResults(parsed.results || {});
           setJournal(parsed.journal || []);
+          setLastExportAt(parsed.lastExportAt || null);
           setLastUpdated(parsed.lastUpdated || null);
         }
       } catch (e) { /* first run, nothing stored yet */ }
@@ -934,9 +946,9 @@ export default function NomzodlarTerminal() {
   // Persist state on change
   useEffect(() => {
     if (!loaded) return;
-    const payload = JSON.stringify({ apiKey, alphaKey, watchlist, weights, risk, fundCriteria, strategies, results, journal, lastUpdated });
+    const payload = JSON.stringify({ apiKey, alphaKey, watchlist, weights, risk, fundCriteria, strategies, results, journal, lastUpdated, lastExportAt });
     storageSet(STORAGE_KEY, payload);
-  }, [apiKey, alphaKey, watchlist, weights, risk, fundCriteria, strategies, results, journal, lastUpdated, loaded]);
+  }, [apiKey, alphaKey, watchlist, weights, risk, fundCriteria, strategies, results, journal, lastUpdated, lastExportAt, loaded]);
 
   const addTickers = () => {
     const parts = tickerInput
@@ -1000,7 +1012,8 @@ export default function NomzodlarTerminal() {
   };
 
   const exportSettings = () => {
-    const payload = { apiKey, alphaKey, watchlist, weights, risk, fundCriteria, strategies, results, journal, lastUpdated, exportedAt: Date.now(), exportVersion: 1 };
+    const now = Date.now();
+    const payload = { apiKey, alphaKey, watchlist, weights, risk, fundCriteria, strategies, results, journal, lastUpdated, exportedAt: now, exportVersion: 1 };
     const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' });
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
@@ -1010,6 +1023,7 @@ export default function NomzodlarTerminal() {
     a.click();
     document.body.removeChild(a);
     URL.revokeObjectURL(url);
+    setLastExportAt(now);
   };
 
   const importSettings = (file) => {
@@ -1027,6 +1041,7 @@ export default function NomzodlarTerminal() {
         if (data.results) setResults(data.results);
         if (Array.isArray(data.journal)) setJournal(data.journal);
         if (data.lastUpdated) setLastUpdated(data.lastUpdated);
+        if (data.exportedAt) setLastExportAt(data.exportedAt);
         alert('Sozlamalar muvaffaqiyatli yuklandi!');
       } catch (err) {
         alert('Fayl formatida xatolik: bu to\u2018g\u2018ri eksport fayli emasga o\u2018xshaydi.');
@@ -1177,6 +1192,29 @@ export default function NomzodlarTerminal() {
     setRunningReversal(false);
   };
 
+  const runBreakoutHourlyCheck = async () => {
+    const targets = watchlist.filter(sym => results[sym]?.breakout?.matched);
+    if (!apiKey || targets.length === 0) return;
+    setRunningBreakoutHL(true);
+    stopFlag.current = false;
+    setProgress({ done: 0, total: targets.length });
+    for (let i = 0; i < targets.length; i++) {
+      if (stopFlag.current) break;
+      const symbol = targets[i];
+      setResults(prev => ({ ...prev, [symbol]: { ...(prev[symbol] || {}), breakoutHLLoading: true } }));
+      try {
+        const hourlyBars = await fetchTimeSeries(symbol, apiKey, '1h', 300);
+        const breakoutHourlyHL = hourlyBars.length >= 40 ? detectBreakoutHourlyHL(hourlyBars) : null;
+        setResults(prev => ({ ...prev, [symbol]: { ...(prev[symbol] || {}), breakoutHourlyHL, breakoutHLLoading: false, breakoutHLError: null } }));
+      } catch (e) {
+        setResults(prev => ({ ...prev, [symbol]: { ...(prev[symbol] || {}), breakoutHLLoading: false, breakoutHLError: e.message } }));
+      }
+      setProgress({ done: i + 1, total: targets.length });
+      if (i < targets.length - 1) await sleep(8000);
+    }
+    setRunningBreakoutHL(false);
+  };
+
   const runPullbackDeepCheck = async () => {
     const targets = watchlist.filter(sym => results[sym]?.pullbackGate?.passedDailyGate);
     if (!apiKey || targets.length === 0) return;
@@ -1249,6 +1287,12 @@ export default function NomzodlarTerminal() {
   }, [watchlist, results, weights, activeStrategies, risk]);
 
   const candidateSymbols = useMemo(() => rows.filter(r => r.isCandidate).map(r => r.symbol), [rows]);
+  const needsExportReminder = useMemo(() => {
+    if (watchlist.length === 0) return false;
+    if (!lastExportAt) return true;
+    const FOURTEEN_DAYS = 14 * 24 * 60 * 60 * 1000;
+    return Date.now() - lastExportAt > FOURTEEN_DAYS;
+  }, [watchlist, lastExportAt]);
   const aggregateRisk = useMemo(() => {
     let totalRisk = 0, totalValue = 0, count = 0;
     for (const row of rows) {
@@ -1282,6 +1326,10 @@ export default function NomzodlarTerminal() {
     () => watchlist.filter(sym => results[sym]?.pullbackGate?.passedDailyGate),
     [watchlist, results]
   );
+  const breakoutMatchedCandidates = useMemo(
+    () => watchlist.filter(sym => results[sym]?.breakout?.matched),
+    [watchlist, results]
+  );
   const estSeconds = watchlist.length > 0 ? (watchlist.length - 1) * 8 : 0;
 
   return (
@@ -1308,6 +1356,11 @@ export default function NomzodlarTerminal() {
             </div>
           </div>
           <div className="flex items-center" style={{ gap: 8, flexWrap: 'wrap' }}>
+            {needsExportReminder && (
+              <span style={{ fontSize: 10.5, color: COLORS.brass }} title="Ma'lumotlaringiz faqat shu brauzerda saqlanadi">
+                {lastExportAt ? `oxirgi zaxira: ${Math.floor((Date.now() - lastExportAt) / (24 * 60 * 60 * 1000))} kun oldin` : "hali zaxira olinmagan"} —
+              </span>
+            )}
             <button onClick={exportSettings}
               style={{ background: COLORS.surfaceRaised, border: `1px solid ${COLORS.hairline}`, color: COLORS.textPrimary, borderRadius: 6, padding: '6px 12px', fontSize: 11.5, fontWeight: 600, cursor: 'pointer' }}>
               Sozlamalarni yuklab olish
@@ -1317,7 +1370,7 @@ export default function NomzodlarTerminal() {
               Sozlamalarni yuklash
             </button>
             <input ref={importFileRef} type="file" accept="application/json" style={{ display: 'none' }}
-              onChange={e => { const f = e.target.files?.[0]; if (f) importSettings(f); e.target.value = ''; }} />
+              onChange={e => { const f = e.target.files?.[0]; if (f && window.confirm("Joriy sozlamalar (kalitlar, ro'yxat, jurnal) tanlangan fayldagi ma'lumot bilan almashtiriladi. Davom etaymi?")) importSettings(f); e.target.value = ''; }} />
             {typeof window !== 'undefined' && typeof window.Notification !== 'undefined' && (
               window.Notification.permission === 'granted' ? (
                 <span style={{ fontSize: 11, color: COLORS.positive, border: `1px solid ${COLORS.positive}`, borderRadius: 6, padding: '5px 10px', display: 'flex', alignItems: 'center', gap: 5 }}>
@@ -1489,7 +1542,7 @@ export default function NomzodlarTerminal() {
         {/* Strategies */}
         <Card title={`Strategiyalar (${strategies.filter(s => s.active).length}/${strategies.length} faol)`} icon={Settings2} right={
           <div className="flex items-center gap-2">
-            <button onClick={resetBuiltinStrategies} title="Uchala professional strategiyani standart holatga qaytaradi (boshqa qo'shgan strategiyalaringiz saqlanadi)"
+            <button onClick={() => { if (window.confirm("Uchala professional strategiyani standart holatga qaytarasizmi? Boshqa qo'shgan strategiyalaringiz saqlanib qoladi.")) resetBuiltinStrategies(); }} title="Uchala professional strategiyani standart holatga qaytaradi (boshqa qo'shgan strategiyalaringiz saqlanadi)"
               style={{ background: 'transparent', border: `1px solid ${COLORS.hairline}`, color: COLORS.textMuted, borderRadius: 6, padding: '4px 10px', fontSize: 11.5, cursor: 'pointer' }}>
               Standartga qaytarish
             </button>
@@ -1654,25 +1707,33 @@ export default function NomzodlarTerminal() {
             {candidateSymbols.length > 0 && <span style={{ fontSize: 10.5, color: COLORS.textMuted, fontFamily: 'IBM Plex Mono, monospace' }}>{candidateSymbols.join(', ')}</span>}
           </div>
           <div className="flex flex-col" style={{ gap: 3 }}>
-            <button onClick={runReversalDeepCheck} disabled={!apiKey || reversalPreCandidates.length === 0 || running || runningFund || runningReversal || runningPullback}
+            <button onClick={runReversalDeepCheck} disabled={!apiKey || reversalPreCandidates.length === 0 || running || runningFund || runningReversal || runningPullback || runningBreakoutHL}
               style={{ background: 'transparent', color: COLORS.textPrimary, border: `1px solid ${COLORS.hairline}`, borderRadius: 6, padding: '9px 16px', fontSize: 13, fontWeight: 600, cursor: (!apiKey || reversalPreCandidates.length === 0) ? 'not-allowed' : 'pointer', opacity: (!apiKey || reversalPreCandidates.length === 0) ? 0.5 : 1 }}>
               Reversal chuqur tekshiruvi ({reversalPreCandidates.length})
             </button>
             {reversalPreCandidates.length > 0 && <span style={{ fontSize: 10.5, color: COLORS.textMuted, fontFamily: 'IBM Plex Mono, monospace' }}>{reversalPreCandidates.join(', ')}</span>}
           </div>
           <div className="flex flex-col" style={{ gap: 3 }}>
-            <button onClick={runPullbackDeepCheck} disabled={!apiKey || pullbackGateCandidates.length === 0 || running || runningFund || runningReversal || runningPullback}
+            <button onClick={runPullbackDeepCheck} disabled={!apiKey || pullbackGateCandidates.length === 0 || running || runningFund || runningReversal || runningPullback || runningBreakoutHL}
               style={{ background: 'transparent', color: COLORS.textPrimary, border: `1px solid ${COLORS.hairline}`, borderRadius: 6, padding: '9px 16px', fontSize: 13, fontWeight: 600, cursor: (!apiKey || pullbackGateCandidates.length === 0) ? 'not-allowed' : 'pointer', opacity: (!apiKey || pullbackGateCandidates.length === 0) ? 0.5 : 1 }}>
               Pullback chuqur tekshiruvi ({pullbackGateCandidates.length})
             </button>
             {pullbackGateCandidates.length > 0 && <span style={{ fontSize: 10.5, color: COLORS.textMuted, fontFamily: 'IBM Plex Mono, monospace' }}>{pullbackGateCandidates.join(', ')}</span>}
           </div>
-          {(running || runningFund || runningReversal || runningPullback) && (
+          <div className="flex flex-col" style={{ gap: 3 }}>
+            <button onClick={runBreakoutHourlyCheck} disabled={!apiKey || breakoutMatchedCandidates.length === 0 || running || runningFund || runningReversal || runningPullback || runningBreakoutHL}
+              title="Ixtiyoriy: Higher Low'ni soatlik ma'lumotda qo'shimcha tasdiqlaydi. Breakout'ning asosiy natijasiga ta'sir qilmaydi."
+              style={{ background: 'transparent', color: COLORS.textPrimary, border: `1px solid ${COLORS.hairline}`, borderRadius: 6, padding: '9px 16px', fontSize: 13, fontWeight: 600, cursor: (!apiKey || breakoutMatchedCandidates.length === 0) ? 'not-allowed' : 'pointer', opacity: (!apiKey || breakoutMatchedCandidates.length === 0) ? 0.5 : 1 }}>
+              Breakout HL tasdig'i, soatlik (ixtiyoriy) ({breakoutMatchedCandidates.length})
+            </button>
+            {breakoutMatchedCandidates.length > 0 && <span style={{ fontSize: 10.5, color: COLORS.textMuted, fontFamily: 'IBM Plex Mono, monospace' }}>{breakoutMatchedCandidates.join(', ')}</span>}
+          </div>
+          {(running || runningFund || runningReversal || runningPullback || runningBreakoutHL) && (
             <button onClick={stopRun} style={{ background: 'transparent', color: COLORS.negative, border: `1px solid ${COLORS.negative}`, borderRadius: 6, padding: '9px 12px', fontSize: 13, fontWeight: 600, cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 5 }}>
               <Square size={12} /> To'xtatish
             </button>
           )}
-          {(running || runningFund || runningReversal || runningPullback) ? (
+          {(running || runningFund || runningReversal || runningPullback || runningBreakoutHL) ? (
             <span style={{ fontFamily: 'IBM Plex Mono, monospace', fontSize: 12, color: COLORS.textMuted }}>
               {progress.done}/{progress.total} tahlil qilindi...
             </span>
@@ -1839,6 +1900,12 @@ export default function NomzodlarTerminal() {
                               <span style={{ color: COLORS.textPrimary }}>{c.label}{c.detail ? <span style={{ color: COLORS.textMuted }}> — {c.detail}</span> : null}</span>
                             </li>
                           ))}
+                          {row.breakoutHourlyHL && (
+                            <li style={{ display: 'flex', gap: 8, alignItems: 'flex-start' }}>
+                              <span style={{ color: row.breakoutHourlyHL.confirmed ? COLORS.positive : COLORS.textMuted, fontWeight: 700, width: 14, flexShrink: 0 }}>{row.breakoutHourlyHL.confirmed ? '\u2713' : '\u2717'}</span>
+                              <span style={{ color: COLORS.textPrimary }}>(ixtiyoriy) Higher Low, soatlik tasdiq<span style={{ color: COLORS.textMuted }}> — {row.breakoutHourlyHL.hlCount} marta topildi</span></span>
+                            </li>
+                          )}
                         </ul>
                       </div>
                     )}
